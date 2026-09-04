@@ -1,0 +1,15 @@
+IEEE MAC-prefix registry capture -- written by cmd/ouifetch.
+Fetched 2026-08-10. Regenerate internal/oui with cmd/ouigen.
+
+oui.csv
+  source: https://standards-oui.ieee.org/oui/oui.csv
+  rows: 39916
+  sha256: 57a6de3c17a7420362e0ef8f12df5d52eec24b69c5ca9ef023240ba05bf4edb9
+mam.csv
+  source: https://standards-oui.ieee.org/oui28/mam.csv
+  rows: 6535
+  sha256: 173af87d3acde4e4eb2e57bcf12acaf00bfd988fdd966a21800ba16c61df7f71
+oui36.csv
+  source: https://standards-oui.ieee.org/oui36/oui36.csv
+  rows: 7127
+  sha256: d0103017324fe623468511749be8f10e0f351d8792971ae2b4d4c2f76637d11b

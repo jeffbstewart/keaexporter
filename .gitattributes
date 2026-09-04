@@ -1,0 +1,5 @@
+# Destined for a Linux container -- keep LF endings even on Windows.
+# This also keeps the vendored IEEE CSVs LF, so cmd/ouigen -verify
+# (which rejects stray control bytes such as CR) stays green on every
+# platform.
+* text=auto eol=lf
