@@ -1,0 +1,6 @@
+# Keep the build context lean and the vendored data out of it: the
+# binary embeds internal/oui/table.txt, not the raw CSVs.
+.git/
+third_party/
+*.exe
+*.test
