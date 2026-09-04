@@ -32,6 +32,28 @@ IEEE-registered vendor; locally-administered (randomized) MACs are
 labeled as such. `/healthz` answers without touching the socket, so a
 reverse proxy's health checks never load Kea.
 
+## High Availability (optional, auto-detected)
+
+If Kea loads the `ha` hook, `status-get` carries a high-availability
+block and keaexporter lights up extra behaviour with no configuration.
+A single-instance server has no such block, so all of this stays inert.
+
+- **Metrics**: `kea_ha_healthy` (1 in a clean paired steady state),
+  `kea_ha_serving` (1 when this server is answering clients -- `sum`
+  across the pair should be exactly 1; 2 is split-brain, 0 is an
+  outage), `kea_ha_partner_in_touch`, and `kea_ha_local_state{role,
+  state}` for the exact role/state. Alert on `kea_ha_healthy == 0` for
+  your grace window to page on "serving from backup or degraded".
+- **Status-page banner**: when the pair is unhealthy the page shows a
+  prominent banner -- "serving from backup", "partner down", "syncing",
+  or "partner unreachable" -- naming the local and partner servers.
+- **`/ready`** (on the metrics port): returns `200` only when the local
+  server is serving-or-synced (`hot-standby`, `load-balancing`,
+  `partner-down`, ...), `503` while `waiting`/`syncing`. Point a
+  Kubernetes readiness probe at it so a rolling restart waits for HA
+  sync before it takes the partner down. Without the `ha` hook, `/ready`
+  is `200` whenever the control socket answers.
+
 ## Usage
 
     keaexporter [flags]

@@ -24,6 +24,17 @@
 // behind a reverse proxy. /healthz on the status listener answers
 // without touching the socket, so a proxy's health checks never load
 // kea.
+//
+// OPTIONAL HA support (auto-detected). When kea loads the ha hook,
+// status-get carries a high-availability block; keaexporter then also
+// exports kea_ha_healthy / kea_ha_serving / kea_ha_partner_in_touch and
+// kea_ha_local_state{role,state}, shows a banner on the status page when
+// the pair is unhealthy (serving from backup, partner-down, syncing),
+// and answers /ready (on the metrics port) with 200 only when the local
+// server is serving-or-synced -- a k8s readiness gate that makes a
+// rolling restart wait for HA sync before it takes the partner down. A
+// single-instance server has no HA block, so all of this stays inert;
+// nothing here is specific to any deployment.
 package main
 
 import (
@@ -61,6 +72,7 @@ func main() {
 
 	e := &exporter{socket: *socket, timeout: *timeout}
 	http.HandleFunc("/metrics", e.metrics)
+	http.HandleFunc("/ready", e.ready)
 	http.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprintln(w, "keaexporter -- see /metrics")
 	})
@@ -157,6 +169,124 @@ func (e *exporter) leases() ([]lease, error) {
 	return out, nil
 }
 
+// haState is the local view of Kea's High Availability relationship,
+// present ONLY when the ha hook is loaded -- a single-instance server
+// has none, and everything below is skipped (HA support is optional).
+// Every field comes straight from status-get; nothing here is specific
+// to any deployment.
+type haState struct {
+	Mode        string // ha-mode, e.g. "hot-standby" or "load-balancing"
+	LocalName   string
+	LocalRole   string // primary | standby | secondary | backup
+	LocalState  string // hot-standby | partner-down | waiting | syncing | ...
+	Serving     bool   // this server is answering clients (non-empty scopes)
+	RemoteName  string
+	RemoteState string
+	InTouch     bool // this server can reach its partner
+}
+
+// parseHA pulls the local HA view out of a status-get Arguments map.
+// ok is false when there is no high-availability block (no ha hook),
+// which is the normal single-instance case.
+func parseHA(status map[string]json.RawMessage) (haState, bool) {
+	raw, ok := status["high-availability"]
+	if !ok {
+		return haState{}, false
+	}
+	// high-availability is an array (one per relationship); a hot-standby
+	// or load-balancing pair has exactly one.
+	var rels []struct {
+		HAMode    string `json:"ha-mode"`
+		HAServers struct {
+			Local struct {
+				ServerName string   `json:"server-name"`
+				Role       string   `json:"role"`
+				State      string   `json:"state"`
+				Scopes     []string `json:"scopes"`
+			} `json:"local"`
+			Remote struct {
+				ServerName string `json:"server-name"`
+				LastState  string `json:"last-state"`
+				InTouch    bool   `json:"in-touch"`
+			} `json:"remote"`
+		} `json:"ha-servers"`
+	}
+	if err := json.Unmarshal(raw, &rels); err != nil || len(rels) == 0 {
+		return haState{}, false
+	}
+	r := rels[0]
+	return haState{
+		Mode:        r.HAMode,
+		LocalName:   r.HAServers.Local.ServerName,
+		LocalRole:   r.HAServers.Local.Role,
+		LocalState:  r.HAServers.Local.State,
+		Serving:     len(r.HAServers.Local.Scopes) > 0,
+		RemoteName:  r.HAServers.Remote.ServerName,
+		RemoteState: r.HAServers.Remote.LastState,
+		InTouch:     r.HAServers.Remote.InTouch,
+	}, true
+}
+
+// healthy is the clean paired steady state: in touch with the partner
+// and in the mode's normal serving state.
+func (h haState) healthy() bool {
+	if !h.InTouch {
+		return false
+	}
+	switch h.LocalState {
+	case "hot-standby", "load-balancing":
+		return true
+	}
+	return false
+}
+
+// ready reports whether the local server is up and serving-or-synced --
+// the k8s readiness signal, so a rolling restart waits for HA sync
+// before it takes the partner down. Transient startup states
+// (waiting/syncing) are deliberately NOT ready.
+func (h haState) ready() bool {
+	switch h.LocalState {
+	case "hot-standby", "load-balancing", "partner-down",
+		"communication-recovery", "partner-in-maintenance":
+		return true
+	}
+	return false
+}
+
+// banner is a short human alert for the status page; empty when healthy.
+func (h haState) banner() string {
+	switch {
+	case h.LocalState == "partner-down" && h.LocalRole == "standby":
+		return "SERVING FROM BACKUP: " + h.LocalName + " (standby) has taken over -- partner " + h.RemoteName + " is down"
+	case h.LocalState == "partner-down":
+		return "PARTNER DOWN: " + h.LocalName + " is serving alone, no redundancy (partner " + h.RemoteName + ")"
+	case h.LocalState == "waiting" || h.LocalState == "syncing":
+		return "SYNCING: " + h.LocalName + " (" + h.LocalState + ") is pairing with " + h.RemoteName
+	case !h.InTouch:
+		return "PARTNER UNREACHABLE: " + h.LocalName + " is not in touch with " + h.RemoteName
+	case !h.healthy():
+		return "HA " + h.LocalState + ": " + h.LocalName + " (" + h.LocalRole + ")"
+	}
+	return ""
+}
+
+// ready is the k8s readiness endpoint. With HA it returns 200 only when
+// the local server is serving/synced (so a rollout gates on HA sync);
+// without HA it returns 200 when the control socket answers. 503
+// otherwise. Served on the metrics listener, which is always up.
+func (e *exporter) ready(w http.ResponseWriter, _ *http.Request) {
+	status, err := e.command("status-get")
+	if err != nil {
+		http.Error(w, "kea did not answer: "+err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	if h, ok := parseHA(status); ok && !h.ready() {
+		http.Error(w, "HA not ready: "+h.LocalState, http.StatusServiceUnavailable)
+		return
+	}
+	fmt.Fprintln(w, "ready")
+}
+
 // statKeyRe splits "subnet[1].pool[0].assigned-addresses" into its
 // optional subnet id, optional pool id, and the bare statistic name.
 var statKeyRe = regexp.MustCompile(`^(?:subnet\[(\d+)\]\.)?(?:pool\[(\d+)\]\.)?([^\[\]]+)$`)
@@ -246,6 +376,27 @@ func (e *exporter) metrics(w http.ResponseWriter, _ *http.Request) {
 		}
 	}
 
+	// HA metrics, only when the ha hook is loaded (optional -- a
+	// single-instance server has no high-availability block).
+	if statusErr == nil {
+		if h, ok := parseHA(status); ok {
+			b2i := func(x bool) int {
+				if x {
+					return 1
+				}
+				return 0
+			}
+			fmt.Fprintf(b, "# HELP kea_ha_healthy 1 when the local HA server is in a clean paired steady state.\n")
+			fmt.Fprintf(b, "# TYPE kea_ha_healthy gauge\nkea_ha_healthy %d\n", b2i(h.healthy()))
+			fmt.Fprintf(b, "# HELP kea_ha_serving 1 when this server is currently answering DHCP clients.\n")
+			fmt.Fprintf(b, "# TYPE kea_ha_serving gauge\nkea_ha_serving %d\n", b2i(h.Serving))
+			fmt.Fprintf(b, "# HELP kea_ha_partner_in_touch 1 when the local server can reach its HA partner.\n")
+			fmt.Fprintf(b, "# TYPE kea_ha_partner_in_touch gauge\nkea_ha_partner_in_touch %d\n", b2i(h.InTouch))
+			fmt.Fprintf(b, "# HELP kea_ha_local_state 1 for the current local HA role and state.\n")
+			fmt.Fprintf(b, "# TYPE kea_ha_local_state gauge\nkea_ha_local_state{role=%q,state=%q} 1\n", h.LocalRole, h.LocalState)
+		}
+	}
+
 	if statsErr == nil {
 		families := translate(stats)
 		names := make([]string, 0, len(families))
@@ -278,7 +429,16 @@ func (e *exporter) status(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "kea did not answer: "+err.Error(), http.StatusBadGateway)
 		return
 	}
-	page, err := renderStatus(ls, time.Now())
+	// A banner when HA is in a non-healthy state (serving from backup,
+	// partner down, syncing). Best-effort: a status-get failure or a
+	// non-HA server just leaves it empty.
+	banner := ""
+	if status, serr := e.command("status-get"); serr == nil {
+		if h, ok := parseHA(status); ok {
+			banner = h.banner()
+		}
+	}
+	page, err := renderStatus(ls, time.Now(), banner)
 	if err != nil {
 		log.Printf("render status: %v", err)
 		http.Error(w, "render: "+err.Error(), http.StatusInternalServerError)
@@ -293,7 +453,8 @@ func (e *exporter) status(w http.ResponseWriter, _ *http.Request) {
 var statusTmpl = template.Must(template.New("status").Parse(`<!doctype html>
 <title>kea leases</title>
 <meta http-equiv="refresh" content="30">
-<style>body{font-family:monospace}table{border-collapse:collapse}th,td{padding:2px 12px;text-align:left;border-bottom:1px solid #ccc}</style>
+<style>body{font-family:monospace}table{border-collapse:collapse}th,td{padding:2px 12px;text-align:left;border-bottom:1px solid #ccc}.ha-banner{background:#c0392b;color:#fff;padding:8px 12px;margin:0 0 12px;font-weight:bold}</style>
+{{if .Banner}}<p class="ha-banner">{{.Banner}}</p>{{end}}
 <h1>{{.Active}} active / {{.Total}} leases</h1>
 <p>as of {{.Now}}</p>
 <table>
@@ -309,11 +470,13 @@ type statusRow struct {
 type statusPage struct {
 	Active, Total int
 	Now           string
+	Banner        string
 	Rows          []statusRow
 }
 
-// renderStatus is the whole page: one row per lease, IP-sorted.
-func renderStatus(ls []lease, now time.Time) ([]byte, error) {
+// renderStatus is the whole page: one row per lease, IP-sorted. banner
+// is a non-empty HA alert string to show above the table, or "".
+func renderStatus(ls []lease, now time.Time, banner string) ([]byte, error) {
 	sort.Slice(ls, func(i, j int) bool {
 		a, aerr := netip.ParseAddr(ls[i].IPAddress)
 		b, berr := netip.ParseAddr(ls[j].IPAddress)
@@ -323,8 +486,9 @@ func renderStatus(ls []lease, now time.Time) ([]byte, error) {
 		return a.Less(b)
 	})
 	page := statusPage{
-		Total: len(ls),
-		Now:   now.Format("2006-01-02 15:04:05 MST"),
+		Total:  len(ls),
+		Now:    now.Format("2006-01-02 15:04:05 MST"),
+		Banner: banner,
 	}
 	for _, l := range ls {
 		if l.State == 0 {

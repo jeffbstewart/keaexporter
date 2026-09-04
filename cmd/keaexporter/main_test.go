@@ -77,7 +77,7 @@ func keys(m map[string][]series) []string {
 
 func mustRender(t *testing.T, ls []lease, now time.Time) string {
 	t.Helper()
-	page, err := renderStatus(ls, now)
+	page, err := renderStatus(ls, now, "")
 	if err != nil {
 		t.Fatalf("renderStatus: %v", err)
 	}
@@ -142,5 +142,91 @@ func TestRenderStatusEmpty(t *testing.T) {
 	page := mustRender(t, nil, time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC))
 	if !strings.Contains(page, "0 active / 0 leases") {
 		t.Errorf("empty pool should render zero counts:\n%s", page)
+	}
+}
+
+func TestParseHANonHA(t *testing.T) {
+	// A single-instance server has no high-availability block -> optional
+	// HA support stays inert.
+	if _, ok := parseHA(map[string]json.RawMessage{"pid": mustRaw(t, "123")}); ok {
+		t.Error("parseHA reported HA present with no high-availability block")
+	}
+}
+
+func TestParseHAHotStandby(t *testing.T) {
+	// Verbatim shape from status-get on the real kea 2.6.5 image (dhcp-a
+	// primary, partner unreachable -> waiting, empty scopes).
+	status := map[string]json.RawMessage{
+		"high-availability": mustRaw(t, `[{
+			"ha-mode": "hot-standby",
+			"ha-servers": {
+				"local":  {"role": "primary", "scopes": [], "server-name": "dhcp-a", "state": "waiting"},
+				"remote": {"in-touch": false, "last-state": "", "role": "standby", "server-name": "dhcp-b"}
+			}
+		}]`),
+	}
+	h, ok := parseHA(status)
+	if !ok {
+		t.Fatal("parseHA did not find the HA block")
+	}
+	if h.LocalName != "dhcp-a" || h.LocalRole != "primary" || h.LocalState != "waiting" {
+		t.Errorf("local parsed wrong: %+v", h)
+	}
+	if h.RemoteName != "dhcp-b" || h.InTouch {
+		t.Errorf("remote parsed wrong: %+v", h)
+	}
+	if h.Serving {
+		t.Error("empty scopes must not be marked serving")
+	}
+	if h.healthy() || h.ready() {
+		t.Error("waiting must be neither healthy nor ready")
+	}
+	if h.banner() == "" {
+		t.Error("waiting should produce a banner")
+	}
+}
+
+func TestHAStatePredicates(t *testing.T) {
+	tests := []struct {
+		h              haState
+		healthy, ready bool
+		bannerHas      string // substring the banner must contain ("" = no banner)
+	}{
+		{haState{LocalState: "hot-standby", InTouch: true}, true, true, ""},
+		{haState{LocalName: "dhcp-b", RemoteName: "dhcp-a", LocalRole: "standby", LocalState: "partner-down", Serving: true}, false, true, "SERVING FROM BACKUP"},
+		{haState{LocalName: "dhcp-a", RemoteName: "dhcp-b", LocalRole: "primary", LocalState: "partner-down", Serving: true}, false, true, "PARTNER DOWN"},
+		{haState{LocalName: "dhcp-a", RemoteName: "dhcp-b", LocalState: "syncing"}, false, false, "SYNCING"},
+		{haState{LocalName: "dhcp-a", RemoteName: "dhcp-b", LocalState: "hot-standby", InTouch: false}, false, true, "PARTNER UNREACHABLE"},
+	}
+	for i, tt := range tests {
+		if got := tt.h.healthy(); got != tt.healthy {
+			t.Errorf("case %d healthy()=%v want %v", i, got, tt.healthy)
+		}
+		if got := tt.h.ready(); got != tt.ready {
+			t.Errorf("case %d ready()=%v want %v", i, got, tt.ready)
+		}
+		b := tt.h.banner()
+		if tt.bannerHas == "" && b != "" {
+			t.Errorf("case %d expected no banner, got %q", i, b)
+		}
+		if tt.bannerHas != "" && !strings.Contains(b, tt.bannerHas) {
+			t.Errorf("case %d banner %q lacks %q", i, b, tt.bannerHas)
+		}
+	}
+}
+
+func TestRenderStatusBanner(t *testing.T) {
+	now := time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC)
+	page, err := renderStatus(nil, now, "SERVING FROM BACKUP: dhcp-b")
+	if err != nil {
+		t.Fatalf("renderStatus: %v", err)
+	}
+	// Match the element, not the always-present .ha-banner CSS rule.
+	if s := string(page); !strings.Contains(s, `class="ha-banner"`) || !strings.Contains(s, "SERVING FROM BACKUP: dhcp-b") {
+		t.Errorf("banner not rendered:\n%s", s)
+	}
+	page2, _ := renderStatus(nil, now, "")
+	if strings.Contains(string(page2), `class="ha-banner"`) {
+		t.Errorf("empty banner should not render the element:\n%s", string(page2))
 	}
 }
