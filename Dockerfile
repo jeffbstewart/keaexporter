@@ -12,10 +12,10 @@
 # in kea's socket group. The image defaults to uid 0; set the run user
 # in the orchestrator if kea's socket group is known.
 #
-# The builder is pinned by digest (golang:1.26.9, resolved 2026-10-09 for
-# the 2026-10-08 Go security release): it controls the output binary,
+# The builder is pinned by digest (golang:1.26.10, resolved 2026-10-26 for
+# the 2026-10-21 Go security release): it controls the output binary,
 # so pin it like a dependency.
-FROM golang:1.26.9@sha256:f1f0bcc2c524a3ced375fcb4d1ecb7aa371aa7070e112599aaca45cc02d0101b AS build
+FROM golang:1.26.10@sha256:672c944cfd07599b5f1bb179869270cdc94c6254e41db4d431259693cb286b82 AS build
 WORKDIR /src
 COPY go.mod ./
 COPY cmd ./cmd
