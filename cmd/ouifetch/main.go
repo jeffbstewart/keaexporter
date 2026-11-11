@@ -84,7 +84,7 @@ func fetch(client *http.Client, url string) ([]byte, error) {
 		return nil, err
 	}
 	// Identify honestly; this is a rare manual capture, not a crawler.
-	req.Header.Set("User-Agent", "homenet-ouifetch (occasional manual capture)")
+	req.Header.Set("User-Agent", "keaexporter-ouifetch (occasional manual capture)")
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err

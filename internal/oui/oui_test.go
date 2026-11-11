@@ -38,7 +38,7 @@ func TestRandomized(t *testing.T) {
 		{"da:11:22:33:44:55", true},
 		{"ee:11:22:33:44:55", true},
 		{"00:1b:c5:09:00:01", false}, // globally unique
-		{"9c:8e:cd:35:c3:67", false}, // a real camera on this LAN
+		{"9c:00:00:00:00:01", false}, // globally unique, other first-octet bits set
 		{"garbage", false},
 	}
 	for _, tt := range tests {

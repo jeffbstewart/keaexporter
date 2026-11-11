@@ -88,17 +88,17 @@ func TestRenderStatusSortsAndEscapes(t *testing.T) {
 	now := time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC)
 	ls := []lease{
 		// Deliberately out of order, with a numeric-vs-lexical trap
-		// (.20.9 sorts after .20.100 lexically) and a hostname that
+		// (.2.9 sorts after .2.100 lexically) and a hostname that
 		// must not survive as markup.
-		{IPAddress: "172.16.20.100", HWAddress: "aa:aa:aa:aa:aa:01", Hostname: "later", CLTT: now.Unix(), ValidLft: 7200, State: 0},
-		{IPAddress: "172.16.20.9", HWAddress: "aa:aa:aa:aa:aa:02", Hostname: "<script>x</script>", CLTT: now.Unix(), ValidLft: 7200, State: 0},
-		{IPAddress: "172.16.20.50", HWAddress: "aa:aa:aa:aa:aa:03", Hostname: "gone", CLTT: now.Add(-3 * time.Hour).Unix(), ValidLft: 7200, State: 2},
+		{IPAddress: "192.0.2.100", HWAddress: "aa:aa:aa:aa:aa:01", Hostname: "later", CLTT: now.Unix(), ValidLft: 7200, State: 0},
+		{IPAddress: "192.0.2.9", HWAddress: "aa:aa:aa:aa:aa:02", Hostname: "<script>x</script>", CLTT: now.Unix(), ValidLft: 7200, State: 0},
+		{IPAddress: "192.0.2.50", HWAddress: "aa:aa:aa:aa:aa:03", Hostname: "gone", CLTT: now.Add(-3 * time.Hour).Unix(), ValidLft: 7200, State: 2},
 	}
 	page := mustRender(t, ls, now)
 
-	i9 := strings.Index(page, "172.16.20.9<")
-	i50 := strings.Index(page, "172.16.20.50<")
-	i100 := strings.Index(page, "172.16.20.100<")
+	i9 := strings.Index(page, "192.0.2.9<")
+	i50 := strings.Index(page, "192.0.2.50<")
+	i100 := strings.Index(page, "192.0.2.100<")
 	if i9 == -1 || i50 == -1 || i100 == -1 || !(i9 < i50 && i50 < i100) {
 		t.Errorf("rows not in numeric IP order (indexes %d %d %d):\n%s", i9, i50, i100, page)
 	}
@@ -122,9 +122,9 @@ func TestRenderStatusVendorColumn(t *testing.T) {
 		// 00:00:00 is Xerox's for all time; 02:... has the locally-
 		// administered bit (randomized); 08:ff:ff is globally-unique
 		// form but absent from the registry (verified at fixture time).
-		{IPAddress: "172.16.20.1", HWAddress: "00:00:00:12:34:56", CLTT: now.Unix(), ValidLft: 7200},
-		{IPAddress: "172.16.20.2", HWAddress: "02:12:34:56:78:9a", CLTT: now.Unix(), ValidLft: 7200},
-		{IPAddress: "172.16.20.3", HWAddress: "08:ff:ff:00:00:01", CLTT: now.Unix(), ValidLft: 7200},
+		{IPAddress: "192.0.2.1", HWAddress: "00:00:00:12:34:56", CLTT: now.Unix(), ValidLft: 7200},
+		{IPAddress: "192.0.2.2", HWAddress: "02:12:34:56:78:9a", CLTT: now.Unix(), ValidLft: 7200},
+		{IPAddress: "192.0.2.3", HWAddress: "08:ff:ff:00:00:01", CLTT: now.Unix(), ValidLft: 7200},
 	}
 	page := mustRender(t, ls, now)
 	if !strings.Contains(page, "XEROX") {
@@ -154,14 +154,14 @@ func TestParseHANonHA(t *testing.T) {
 }
 
 func TestParseHAHotStandby(t *testing.T) {
-	// Verbatim shape from status-get on the real kea 2.6.5 image (dhcp-a
-	// primary, partner unreachable -> waiting, empty scopes).
+	// Verbatim shape from status-get on kea 2.6.5 (a primary whose
+	// partner is unreachable -> waiting, empty scopes).
 	status := map[string]json.RawMessage{
 		"high-availability": mustRaw(t, `[{
 			"ha-mode": "hot-standby",
 			"ha-servers": {
-				"local":  {"role": "primary", "scopes": [], "server-name": "dhcp-a", "state": "waiting"},
-				"remote": {"in-touch": false, "last-state": "", "role": "standby", "server-name": "dhcp-b"}
+				"local":  {"role": "primary", "scopes": [], "server-name": "kea-primary", "state": "waiting"},
+				"remote": {"in-touch": false, "last-state": "", "role": "standby", "server-name": "kea-standby"}
 			}
 		}]`),
 	}
@@ -169,10 +169,10 @@ func TestParseHAHotStandby(t *testing.T) {
 	if !ok {
 		t.Fatal("parseHA did not find the HA block")
 	}
-	if h.LocalName != "dhcp-a" || h.LocalRole != "primary" || h.LocalState != "waiting" {
+	if h.LocalName != "kea-primary" || h.LocalRole != "primary" || h.LocalState != "waiting" {
 		t.Errorf("local parsed wrong: %+v", h)
 	}
-	if h.RemoteName != "dhcp-b" || h.InTouch {
+	if h.RemoteName != "kea-standby" || h.InTouch {
 		t.Errorf("remote parsed wrong: %+v", h)
 	}
 	if h.Serving {
@@ -193,10 +193,10 @@ func TestHAStatePredicates(t *testing.T) {
 		bannerHas      string // substring the banner must contain ("" = no banner)
 	}{
 		{haState{LocalState: "hot-standby", InTouch: true}, true, true, ""},
-		{haState{LocalName: "dhcp-b", RemoteName: "dhcp-a", LocalRole: "standby", LocalState: "partner-down", Serving: true}, false, true, "SERVING FROM BACKUP"},
-		{haState{LocalName: "dhcp-a", RemoteName: "dhcp-b", LocalRole: "primary", LocalState: "partner-down", Serving: true}, false, true, "PARTNER DOWN"},
-		{haState{LocalName: "dhcp-a", RemoteName: "dhcp-b", LocalState: "syncing"}, false, false, "SYNCING"},
-		{haState{LocalName: "dhcp-a", RemoteName: "dhcp-b", LocalState: "hot-standby", InTouch: false}, false, true, "PARTNER UNREACHABLE"},
+		{haState{LocalName: "kea-standby", RemoteName: "kea-primary", LocalRole: "standby", LocalState: "partner-down", Serving: true}, false, true, "SERVING FROM BACKUP"},
+		{haState{LocalName: "kea-primary", RemoteName: "kea-standby", LocalRole: "primary", LocalState: "partner-down", Serving: true}, false, true, "PARTNER DOWN"},
+		{haState{LocalName: "kea-primary", RemoteName: "kea-standby", LocalState: "syncing"}, false, false, "SYNCING"},
+		{haState{LocalName: "kea-primary", RemoteName: "kea-standby", LocalState: "hot-standby", InTouch: false}, false, true, "PARTNER UNREACHABLE"},
 	}
 	for i, tt := range tests {
 		if got := tt.h.healthy(); got != tt.healthy {
@@ -217,12 +217,12 @@ func TestHAStatePredicates(t *testing.T) {
 
 func TestRenderStatusBanner(t *testing.T) {
 	now := time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC)
-	page, err := renderStatus(nil, now, "SERVING FROM BACKUP: dhcp-b")
+	page, err := renderStatus(nil, now, "SERVING FROM BACKUP: kea-standby")
 	if err != nil {
 		t.Fatalf("renderStatus: %v", err)
 	}
 	// Match the element, not the always-present .ha-banner CSS rule.
-	if s := string(page); !strings.Contains(s, `class="ha-banner"`) || !strings.Contains(s, "SERVING FROM BACKUP: dhcp-b") {
+	if s := string(page); !strings.Contains(s, `class="ha-banner"`) || !strings.Contains(s, "SERVING FROM BACKUP: kea-standby") {
 		t.Errorf("banner not rendered:\n%s", s)
 	}
 	page2, _ := renderStatus(nil, now, "")
