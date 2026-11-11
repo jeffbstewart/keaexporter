@@ -64,9 +64,9 @@ func main() {
 	statusPort := fs.Int("status-port", 9548, "lease status page port (0 disables)")
 	timeout := fs.Duration("timeout", 5*time.Second, "per-scrape deadline for the socket conversation")
 	// -version exists to give image pre-pullers a no-op invocation:
-	// this is a FROM scratch image with no shell, and the homenet
-	// mission-critical boot machinery (docs/MCBOOT.md there) needs
-	// every cached image to have a command that exits 0.
+	// this is a FROM scratch image with no shell, and the operator's
+	// cold-boot image pre-pull machinery needs every cached image to
+	// have a command that exits 0.
 	version := fs.Bool("version", false, "print the program name and exit")
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		if err == flag.ErrHelp {
