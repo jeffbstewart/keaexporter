@@ -2,6 +2,11 @@ package main
 
 import (
 	"encoding/json"
+	"io"
+	"net"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -228,5 +233,140 @@ func TestRenderStatusBanner(t *testing.T) {
 	page2, _ := renderStatus(nil, now, "")
 	if strings.Contains(string(page2), `class="ha-banner"`) {
 		t.Errorf("empty banner should not render the element:\n%s", string(page2))
+	}
+}
+
+func TestLeaseCounts(t *testing.T) {
+	ls := []lease{{State: 0}, {State: 0}, {State: 1}, {State: 2}, {State: 2}, {State: 2}, {State: 7}}
+	got := leaseCounts(ls)
+	want := map[string]int{"active": 2, "declined": 1, "expired-reclaimed": 3, "other": 1}
+	if len(got) != len(want) {
+		t.Fatalf("leaseCounts = %v, want %v", got, want)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("leaseCounts[%q] = %d, want %d", k, got[k], v)
+		}
+	}
+}
+
+// Every named state is written even at zero, so two servers' series
+// always line up; "other" appears only when a lease has such a state.
+func TestWriteLeaseCounts(t *testing.T) {
+	b := &strings.Builder{}
+	writeLeaseCounts(b, nil)
+	for _, want := range []string{
+		"# TYPE kea_leases gauge\n",
+		`kea_leases{state="active"} 0` + "\n",
+		`kea_leases{state="declined"} 0` + "\n",
+		`kea_leases{state="expired-reclaimed"} 0` + "\n",
+	} {
+		if !strings.Contains(b.String(), want) {
+			t.Errorf("empty table: output lacks %q:\n%s", want, b.String())
+		}
+	}
+	if strings.Contains(b.String(), `state="other"`) {
+		t.Errorf("empty table wrote an \"other\" series:\n%s", b.String())
+	}
+
+	b.Reset()
+	writeLeaseCounts(b, []lease{{State: 0}, {State: 0}, {State: 9}})
+	for _, want := range []string{`kea_leases{state="active"} 2` + "\n", `kea_leases{state="other"} 1` + "\n"} {
+		if !strings.Contains(b.String(), want) {
+			t.Errorf("output lacks %q:\n%s", want, b.String())
+		}
+	}
+}
+
+// fakeKea answers each control command with a canned JSON response
+// on a unix socket, one command per connection as kea does.
+func fakeKea(t *testing.T, answers map[string]string) *exporter {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "kea")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	path := filepath.Join(dir, "s")
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		t.Skipf("unix sockets unavailable here: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			var req struct {
+				Command string `json:"command"`
+			}
+			if json.NewDecoder(conn).Decode(&req) == nil {
+				ans, ok := answers[req.Command]
+				if !ok {
+					ans = `{"result":1,"text":"unexpected command"}`
+				}
+				io.WriteString(conn, ans)
+			}
+			conn.Close()
+		}
+	}()
+	return &exporter{socket: path, timeout: 5 * time.Second}
+}
+
+func scrape(t *testing.T, e *exporter) string {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	e.metrics(rec, httptest.NewRequest("GET", "/metrics", nil))
+	return rec.Body.String()
+}
+
+const (
+	okStats  = `{"result":0,"arguments":{"pkt4-ack-sent":[[3,"2026-01-01 00:00:00.000000"]]}}`
+	okStatus = `{"result":0,"arguments":{"uptime":10,"reload":10}}`
+)
+
+func TestMetricsLeaseCounts(t *testing.T) {
+	e := fakeKea(t, map[string]string{
+		"statistic-get-all": okStats,
+		"status-get":        okStatus,
+		"lease4-get-all":    `{"result":0,"arguments":{"leases":[{"ip-address":"192.0.2.10","state":0},{"ip-address":"192.0.2.11","state":0},{"ip-address":"192.0.2.12","state":1}]}}`,
+	})
+	out := scrape(t, e)
+	for _, want := range []string{"kea_up 1\n", `kea_leases{state="active"} 2` + "\n", `kea_leases{state="declined"} 1` + "\n", "kea_pkt4_ack_sent 3\n"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("scrape lacks %q:\n%s", want, out)
+		}
+	}
+}
+
+// Result 3 is kea's "no leases" answer: a real, empty table, which is
+// exactly the number a standby that failed to sync must report.
+func TestMetricsEmptyLeaseTable(t *testing.T) {
+	e := fakeKea(t, map[string]string{
+		"statistic-get-all": okStats,
+		"status-get":        okStatus,
+		"lease4-get-all":    `{"result":3,"text":"0 IPv4 lease(s) found."}`,
+	})
+	if out := scrape(t, e); !strings.Contains(out, `kea_leases{state="active"} 0`+"\n") {
+		t.Errorf("an empty table must still report zero:\n%s", out)
+	}
+}
+
+// Without the lease_cmds hook the count is absent, not zero -- a zero
+// would read as an empty table -- and the server is still up.
+func TestMetricsWithoutLeaseCmds(t *testing.T) {
+	e := fakeKea(t, map[string]string{
+		"statistic-get-all": okStats,
+		"status-get":        okStatus,
+		"lease4-get-all":    `{"result":2,"text":"'lease4-get-all' command not supported."}`,
+	})
+	out := scrape(t, e)
+	if strings.Contains(out, "kea_leases") {
+		t.Errorf("no lease_cmds hook, but kea_leases was written:\n%s", out)
+	}
+	if !strings.Contains(out, "kea_up 1\n") {
+		t.Errorf("a missing hook must not read as kea down:\n%s", out)
 	}
 }
