@@ -40,6 +40,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"html/template"
@@ -156,6 +157,12 @@ type lease struct {
 	State     int    `json:"state"`
 }
 
+// errNoLeaseCmds is leases' answer from a server without the
+// lease_cmds hook: kea rejects lease4-get-all as unsupported (result
+// 2).  That is a configuration, not a failure, so /metrics leaves the
+// lease counts out without logging on every scrape.
+var errNoLeaseCmds = errors.New("lease4-get-all is not supported (lease_cmds hook not loaded)")
+
 // leases runs lease4-get-all (registered by the lease_cmds hook). Kea
 // answers an empty pool with result 3 ("empty"), not 0 -- that is a
 // valid no-leases answer, not an error.
@@ -166,6 +173,8 @@ func (e *exporter) leases() ([]lease, error) {
 	}
 	switch resp.Result {
 	case 0:
+	case 2:
+		return nil, errNoLeaseCmds
 	case 3:
 		return nil, nil
 	default:
@@ -406,6 +415,17 @@ func (e *exporter) metrics(w http.ResponseWriter, _ *http.Request) {
 		}
 	}
 
+	// The lease table's real size, counted from the table itself.
+	// The subnet statistics below are not a substitute: on an HA pair
+	// assigned-addresses has been seen at 0 and at -1 on servers
+	// holding a full table.
+	switch ls, err := e.leases(); {
+	case err == nil:
+		writeLeaseCounts(b, ls)
+	case !errors.Is(err, errNoLeaseCmds):
+		log.Printf("lease4-get-all: %v", err)
+	}
+
 	if statsErr == nil {
 		families := translate(stats)
 		names := make([]string, 0, len(families))
@@ -427,6 +447,42 @@ func (e *exporter) metrics(w http.ResponseWriter, _ *http.Request) {
 }
 
 var stateNames = map[int]string{0: "active", 1: "declined", 2: "expired-reclaimed"}
+
+// leaseStates is the fixed order kea_leases is written in.  Every
+// named state is always present, zero included, so a comparison
+// between two servers never meets a missing series; "other" (a state
+// this program does not know) appears only when there is one.
+var leaseStates = []string{"active", "declined", "expired-reclaimed"}
+
+// leaseCounts tallies the lease table by state name.
+func leaseCounts(ls []lease) map[string]int {
+	counts := map[string]int{}
+	for _, l := range ls {
+		name, ok := stateNames[l.State]
+		if !ok {
+			name = "other"
+		}
+		counts[name]++
+	}
+	return counts
+}
+
+// writeLeaseCounts emits kea_leases{state=...}: the size of the
+// lease table as lease4-get-all returns it.  Summed over state it is
+// the count the status page heads its table with, and on an HA pair
+// the two servers' sums should agree -- a standby whose sum is far
+// below the primary's has not synced, whatever its HA state says.
+func writeLeaseCounts(b *strings.Builder, ls []lease) {
+	counts := leaseCounts(ls)
+	fmt.Fprintf(b, "# HELP kea_leases Leases in the lease table (lease4-get-all), by state.\n")
+	fmt.Fprintf(b, "# TYPE kea_leases gauge\n")
+	for _, name := range leaseStates {
+		fmt.Fprintf(b, "kea_leases{state=%q} %d\n", name, counts[name])
+	}
+	if n := counts["other"]; n > 0 {
+		fmt.Fprintf(b, "kea_leases{state=\"other\"} %d\n", n)
+	}
+}
 
 // status serves the human lease table. Every request dials kea fresh --
 // same cost profile as a /metrics scrape, and LAN-only traffic at human

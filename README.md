@@ -22,6 +22,15 @@ Prometheus text.
 
   Translated series are declared `untyped`: Kea mixes counters and
   gauges in one namespace, and `rate()` works on untyped just fine.
+- `kea_leases{state="active"|"declined"|"expired-reclaimed"}` -- the
+  lease table counted directly (`lease4-get-all`, so it needs Kea's
+  `lease_cmds` hook; without the hook the series is simply absent).
+  `sum(kea_leases)` is the table's size.  Use it, not
+  `kea_subnet_assigned_addresses`, to compare the two servers of an HA
+  pair: the subnet statistic has been seen at 0 and at -1 on servers
+  holding a full, synced table.  A standby
+  whose `sum(kea_leases)` is far below its partner's has not synced,
+  whatever its HA state says.
 
 ## Lease status page
 
